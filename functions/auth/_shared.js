@@ -14,7 +14,7 @@
 // safe to ship to the client, so hardcoding it here matches the existing setup.
 // Allow env overrides so preview/staging projects can point elsewhere.
 export const getConfig = (env = {}) => ({
-  url: env.SUPABASE_URL || 'https://xkbqiiwwgfzkyfhxuoev.supabase.co',
+  url: env.SUPABASE_URL || 'https://muaxdvcwcszrbneiaoiy.supabase.co',
   anonKey: env.SUPABASE_ANON_KEY || 'sb_publishable_qr9YBIA6n32r-mcqKbkpgA_0XVTUSI7',
 })
 

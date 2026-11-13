@@ -124,9 +124,9 @@ SUPABASE_SERVICE_KEY
 Variables:
 
 ```text
-SUPABASE_URL=https://xkbqiiwwgfzkyfhxuoev.supabase.co
+SUPABASE_URL=https://muaxdvcwcszrbneiaoiy.supabase.co
 FRONTEND_URL=https://qimendao.com,https://www.qimendao.com
-WHITELIST_EMAILS=linjunyan0726@vip.qq.com,blairzbz1112@gmail.com,yangyue99329@126.com
+WHITELIST_EMAILS=2585469768@qq.com
 ```
 
 `SUPABASE_SERVICE_KEY` can be either the legacy `service_role` key or the newer Supabase `sb_secret_...` key. It must stay server-side only.

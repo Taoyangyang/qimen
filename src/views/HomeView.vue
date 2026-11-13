@@ -2171,7 +2171,7 @@ const handleAuth = async () => {
 const handleGoogleAuth = async () => {
   googleAuthLoading.value = true
   try {
-    const href = typeof window === 'undefined' ? 'https://xkbqiiwwgfzkyfhxuoev.supabase.co' : window.location.href
+    const href = typeof window === 'undefined' ? 'https://muaxdvcwcszrbneiaoiy.supabase.co' : window.location.href
     const { error } = await supabase.auth.signInWithOAuth(buildGoogleOAuthSignInArgs(href))
     if (error) throw error
   } catch (error) {
@@ -2185,7 +2185,7 @@ const handleResetPasswordEmail = async () => {
   resetEmailLoading.value = true
   resetEmailNotice.value = ''
   try {
-    const href = typeof window === 'undefined' ? 'https://xkbqiiwwgfzkyfhxuoev.supabase.co' : window.location.href
+    const href = typeof window === 'undefined' ? 'https://muaxdvcwcszrbneiaoiy.supabase.co' : window.location.href
     const { error } = await supabase.auth.resetPasswordForEmail(authForm.email, buildPasswordResetEmailArgs(href))
     if (error) throw error
     resetEmailNotice.value = '重设密码邮件已发送，请前往邮箱查收。'

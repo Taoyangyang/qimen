@@ -1,5 +1,7 @@
 # 新设备开发环境搭建
 
+本地启动方式、API 目标、Worker 与 Supabase 数据落点说明见[本地开发服务启动手册](docs/local-development-services.md)。
+
 ## 1. 拉代码 & 安装依赖
 
 ```bash

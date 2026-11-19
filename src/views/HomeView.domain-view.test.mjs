@@ -1,8 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { resolveSource } from '../i18n/testing/resolveSource.mjs'
+import zhResult from '../i18n/locales/zh-CN/result.mjs'
 
-const source = readFileSync(new URL('./HomeView.vue', import.meta.url), 'utf8')
+const source = resolveSource(readFileSync(new URL('./HomeView.vue', import.meta.url), 'utf8'))
 
 test('奇门结果卡片按四个模块顺序渲染且不展示 M 编号', () => {
   assert.match(source, /const getApiBase = \(\) =>/)
@@ -179,8 +181,11 @@ test('八字问答结果把枚举 meta 渲染为用户可读标签', () => {
   assert.ok(cardStart > -1)
   assert.ok(cardEnd > cardStart)
   assert.match(source, /baziAnalysisModeLabel/)
-  assert.match(source, /当前状态/)
-  assert.match(source, /精确领域/)
+  // 枚举标签走 result.bazi.* 词条，按枚举值动态取键
+  assert.match(source, /result\.bazi\.mode\.\$\{/)
+  assert.match(source, /result\.bazi\.fallbackLevel\.\$\{/)
+  assert.equal(zhResult.bazi.mode.status, '当前状态')
+  assert.equal(zhResult.bazi.fallbackLevel.subcategory, '精确领域')
   assert.match(cardSource, /<div class="mag-result tone-\$\{heroTone\}"/)
   assert.doesNotMatch(cardSource, /[“”]/)
   assert.doesNotMatch(source, /<span>\$\{meta\.analysis_mode \|\| 'bazi'\}<\/span>/)
@@ -387,10 +392,11 @@ test('问事结果页 Tab 随滚动位置通用联动', () => {
 })
 
 test('八字问答结果按 PRD 补齐 pattern character 和 timing 字段展示', () => {
-  assert.match(source, /先天结构适配/)
+  assert.match(source, /result\.bazi\.assessment\.\$\{/)
+  assert.equal(zhResult.bazi.assessment.innate_capacity, '先天结构适配')
+  assert.equal(zhResult.bazi.assessment.portrait_confidence, '人物倾向画像')
   assert.match(source, /readings\.structural_supports/)
   assert.match(source, /readings\.structural_risks/)
-  assert.match(source, /人物倾向画像/)
   assert.match(source, /buildPortraitBlockHTML/)
   assert.match(source, /readings\.appearance_tendency/)
   assert.match(source, /readings\.personality_tendency/)
@@ -441,7 +447,7 @@ test('八字问答结果不展示兼容 analysis 摘要和 fallback 边界提示
 })
 
 test('背书板块采用八字档案专业排盘结构而不是临时卡片', () => {
-  const component = readFileSync(new URL('../components/BaziBackingPanel.vue', import.meta.url), 'utf8')
+  const component = resolveSource(readFileSync(new URL('../components/BaziBackingPanel.vue', import.meta.url), 'utf8'))
   assert.match(component, /BaziPillarTable/)
   assert.match(component, /专业四柱大运流年/)
   assert.match(component, /linkage-row/)
@@ -450,8 +456,9 @@ test('背书板块采用八字档案专业排盘结构而不是临时卡片', ()
   assert.match(component, /xiaoyunList/)
   assert.match(component, /current_liunian/)
   assert.match(component, /selectedDayun/)
-  assert.match(component, /流<br>月/)
-  assert.match(component, /流<br>日/)
+  // 行名改为竖排（writing-mode），不再用 <br> 断行
+  assert.match(component, /流月/)
+  assert.match(component, /流日/)
   assert.doesNotMatch(component, /命盘背书/)
 })
 

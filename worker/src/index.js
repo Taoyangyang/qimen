@@ -12,19 +12,26 @@ import { Solar, Lunar } from 'lunar-javascript';
 import C from '../../lib/QimenConstants.js';
 import U from '../../lib/QimenUtils.js';
 import Calc from '../../lib/QimenCalculations.js';
-import { buildFrontendCopyProtocolSection, buildQimenInferenceRulesSection, buildQimenOutputContractSection, buildReportSchemaPromptSection, buildScoreAuditPromptSection, buildSummaryPromptSection } from '../../lib/qimenPromptSections.js';
+import { buildQimenSystemPrompt, buildScoreEvidenceSection } from '../../lib/qimenPromptSections.js';
 import { buildFollowupClassifierPrompt, buildFollowupPatchPrompt, normalizeFollowupRoute, buildBaziFollowupPrompt, normalizeBaziFollowupDecision, PATCHABLE_SECTIONS } from '../../lib/wenshiFollowup.js';
 import { buildDomainViewPromptSection, buildYongshenPromptSection } from '../../lib/qimenYongshenRules.js';
 import { buildTimingPromptSection } from '../../lib/qimenTimingRules.js';
 import { buildPolarityPromptSection } from '../../lib/qimenPolarityRules.js';
-import { buildQimenEvidence } from '../../lib/qimenPipeline.js';
+import { buildQimenEvidence, toSimplified } from '../../lib/qimenPipeline.js';
 import { parsePanTime } from '../../lib/panTime.js';
 import baziCore from '../../lib/baziCore.js';
+import synastry from '../../lib/synastry/index.js';
+import { buildCalibrationPrompt } from '../../lib/baziCalibrationPrompt.js';
 import qimenLlmOutput from '../../lib/qimenLlmOutput.js';
 import accountQuota from '../../lib/accountQuota.js';
 import baziLlmSections from '../../lib/baziLlmSections.js';
 import llmFetch from '../../lib/llmFetch.js';
 import { langfuseTelemetry } from './langfuse.mjs';
+import requestLocaleLib from '../../lib/i18n/requestLocale.js';
+import serverMessages from '../../lib/i18n/serverMessages.js';
+import outputLanguage from '../../lib/i18n/outputLanguage.js';
+import detectProseLocale from '../../lib/i18n/detectProseLocale.js';
+import sseChips from '../../lib/i18n/sseChips.js';
 
 const { buildCompleteBaziDetail, buildQualitativeSections, hasCompleteLlmCache, hasLatestEngineCache, hasExistingLlm, CALIBRATION_VERSION, computeEventsHash, hasValidCalibration } = baziCore;
 const { normalizeQimenLlmOutput } = qimenLlmOutput;
@@ -50,15 +57,23 @@ const DEFAULT_LLM_DEEP_MODEL = 'deepseek-v4-pro';
 
 const fastModel = env => env.LLM_FAST_MODEL || DEFAULT_LLM_FAST_MODEL;
 const deepModel = env => env.LLM_DEEP_MODEL || DEFAULT_LLM_DEEP_MODEL;
+// 生成温度：问事输出是多段带哨兵标记的结构，温度高了容易漏段、标记写错；文采靠 prompt，不靠温度。
+const QIMEN_ANSWER_TEMPERATURE = 0.4;
+const BAZI_ANSWER_TEMPERATURE = 0.5;
+const FOLLOWUP_TEMPERATURE = 0.5;
+
 // 问事/追问模型：QUESTION_MODEL 可单独覆盖（如 preview 试新模型）
 const resolveQuestionModel = env => env.QUESTION_MODEL || fastModel(env);
 
 // DeepSeek 默认开思考：temperature 失效、首 token 变慢且推理 token 计费，统一关掉。
 // 超时见 lib/llmFetch.js：非流式总时限，流式按首包 / 空闲 / 总时限，超时抛 504。
+// max_tokens 兜底：线上最长输出约 6k 字（≈4-5k token），8192 足够；防止输出失控时只能等超时。
+const DEFAULT_LLM_MAX_TOKENS = 8192;
 function fetchLLM(env, body) {
+  const withLimit = body.max_tokens ? body : { ...body, max_tokens: DEFAULT_LLM_MAX_TOKENS };
   const payload = String(body.model || '').startsWith('deepseek')
-    ? { ...body, thinking: { type: 'disabled' } }
-    : body;
+    ? { ...withLimit, thinking: { type: 'disabled' } }
+    : withLimit;
   return fetchWithLlmTimeout(env.LLM_API_URL || DEFAULT_LLM_API_URL, {
     method: 'POST',
     headers: {
@@ -68,6 +83,27 @@ function fetchLLM(env, body) {
     body: JSON.stringify(payload),
   }, body.stream ? LLM_STREAM_TIMEOUTS : LLM_JSON_TIMEOUTS);
 }
+// prompt 可以是字符串（整段放 user），也可以是 { system, user }：
+// 固定不变的角色/规则/输出格式放 system 且在最前，DeepSeek 按前缀自动缓存，命中部分输入价格低很多；
+// 用户问题和盘面数据放 user，指令与用户输入也因此分开。
+function toLLMMessages(prompt) {
+  if (prompt && typeof prompt === 'object' && !Array.isArray(prompt)) {
+    const messages = [];
+    if (prompt.system) messages.push({ role: 'system', content: String(prompt.system) });
+    messages.push({ role: 'user', content: String(prompt.user || '') });
+    return messages;
+  }
+  return [{ role: 'user', content: String(prompt || '') }];
+}
+
+// 审计表里存一份可读全文。
+function promptToText(prompt) {
+  if (prompt && typeof prompt === 'object' && !Array.isArray(prompt)) {
+    return [prompt.system ? `【system】\n${prompt.system}` : '', `【user】\n${prompt.user || ''}`].filter(Boolean).join('\n\n');
+  }
+  return String(prompt || '');
+}
+
 const BAZI_PROFILE_BASE_FIELDS = 'id, user_id, name, gender, birth_date, bazi_str, bazi_detail, strong_weak, geju, favorable_elements, unfavorable_elements';
 const BAZI_PROFILE_QUESTION_SELECT = BAZI_PROFILE_BASE_FIELDS;
 const BAZI_PROFILE_PANEL_SELECT = BAZI_PROFILE_BASE_FIELDS;
@@ -112,7 +148,7 @@ function parseAuditDelta(value) {
   return Math.round(clampNumber(match ? Number(match[0]) : 0, -20, 20));
 }
 
-function deriveScoreBasisFromM3(m3Inference, formationAdjustments, finalScore) {
+function deriveScoreBasisFromM3(m3Inference, formationAdjustments, finalScore, contentLocale = 'zh-CN') {
   const positive = [];
   const negative = [];
   const textOf = (...values) => values.find(v => typeof v === 'string' && v.trim()) || '';
@@ -165,7 +201,7 @@ function deriveScoreBasisFromM3(m3Inference, formationAdjustments, finalScore) {
     });
   }
 
-  const fallbackLogic = `综合用神状态、主客关系、空亡与应期后，本局落在${finalScore >= 75 ? '偏有利' : finalScore >= 60 ? '中等可观察' : finalScore >= 40 ? '偏谨慎' : '明显谨慎'}区间。`;
+  const fallbackLogic = serverMessages.scoreLogicFallback(finalScore, contentLocale);
   return {
     positive_signals: positive.slice(0, 3),
     negative_signals: negative.slice(0, 3),
@@ -178,6 +214,8 @@ function sanitizeUserText(value) {
     .replace(/后端初分\s*\d+[^，。；,.]*[，。；,.]?/g, '')
     .replace(/后端[^，。；,.]*?(?:下调|上调|审计|初算|初分|preliminary|backend|audit)[^，。；,.]*[，。；,.]?/gi, '')
     .replace(/(?:LLM|模型)?审计修正\s*[+-]?\d+[^，。；,.]*[，。；,.]?/gi, '')
+    .replace(/\b(?:the\s+)?backend\s+(?:pre-?score|preliminary\s+score|score)\b[^,.;]*[,.;]?/gi, '')
+    .replace(/\b(?:model\s+|LLM\s+)?audit\s+(?:adjustment|delta|correction)\s*[+-]?\d*[^,.;]*[,.;]?/gi, '')
     .replace(/audit_delta|backend_pre_score|final_score_suggestion|preliminary_score_audit|qimen-score-v\d(?:\.\d+)?/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -256,6 +294,20 @@ function buildQimenAuditSnapshot({
   };
 }
 
+// 审计用的请求来源信息：只存国家码、界面语言、时区、浏览器首选语言，不存原始 IP。
+function getRequestGeo(request, body) {
+  const clip = (v, n) => { const t = String(v || '').trim(); return t ? t.slice(0, n) : null; };
+  const cf = request?.cf || {};
+  const country = clip(request?.headers?.get('CF-IPCountry') || cf.country, 8);
+  const acceptLang = String(request?.headers?.get('Accept-Language') || '').split(',')[0].split(';')[0];
+  return {
+    country: country && !['XX', 'T1'].includes(country.toUpperCase()) ? country.toUpperCase() : null,
+    ui_locale: clip(body?.locale, 16),
+    tz: clip(cf.timezone, 64),
+    browser_lang: clip(acceptLang, 16)
+  };
+}
+
 function getAllowedOrigins(env) {
   const configuredOrigins = String(env.FRONTEND_URL || '')
     .split(',')
@@ -284,6 +336,10 @@ function getCorsHeaders(request, env, allowedHeaders = 'Content-Type, Authorizat
 }
 
 function json(payload, init = {}, request, env) {
+  // 错误响应统一带稳定的 code（§5.8）；error 中文文本保持不变做兼容
+  if (payload && typeof payload === 'object' && payload.error && !payload.code && (init.status || 200) >= 400) {
+    payload = { ...payload, code: serverMessages.inferErrorCode(payload.error, init.status) };
+  }
   const headers = new Headers(init.headers || {});
   headers.set('Content-Type', 'application/json; charset=utf-8');
 
@@ -327,11 +383,7 @@ function createSSEResponse(request, env) {
   return { emit, close, response: new Response(stream, { status: 200, headers }) };
 }
 
-const QIMEN_CATEGORY_LABELS = {
-  career_business: '事业运势', finance_wealth: '财运分析',
-  relationship: '感情婚恋', health_action: '健康行动', general: '综合运势',
-};
-const QIMEN_SCORE_LABEL = s => s >= 70 ? '中上吉' : s >= 50 ? '中平' : '偏凶';
+const QIMEN_SCORE_LABEL = sseChips.qimenScoreLabel;
 
 async function readJson(request) {
   if (!request.body) return {};
@@ -353,7 +405,7 @@ async function classifyByFastLlmWithEnv(question, ruleResult, env, ctx, traceMet
   try {
   const response = await fetchLLM(env, {
     model,
-    messages: [{ role: 'user', content: prompt }],
+    messages: toLLMMessages(prompt),
     response_format: { type: 'json_object' },
     temperature: 0.1,
   });
@@ -550,9 +602,7 @@ async function enforceQuota(user, env) {
     .eq('user_id', user.id);
 
   if (!error && count >= 3) {
-    const err = new Error('您的 3 次免费天机推演额度已用尽');
-    err.status = 403;
-    throw err;
+    throw serverMessages.quotaError('您的 3 次免费天机推演额度已用尽');
   }
 }
 
@@ -570,7 +620,9 @@ function toLangfuseUsage(usage) {
   const output = usage.completion_tokens ?? usage.output_tokens;
   const total = usage.total_tokens ?? (input != null && output != null ? input + output : undefined);
   if (input == null && output == null && total == null) return undefined;
-  return { input, output, total, unit: 'TOKENS' };
+  // DeepSeek 前缀缓存命中数，用来核对 system 拆分后的缓存效果
+  const cacheRead = usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens;
+  return { input, output, total, ...(Number.isFinite(cacheRead) ? { input_cache_read: cacheRead } : {}), unit: 'TOKENS' };
 }
 
 function beginLangfuseGeneration({ name, model, input, temperature, traceMeta = {} }, env, ctx) {
@@ -608,12 +660,12 @@ async function requestLLM(prompt, env, model = deepModel(env), temperature = 0.5
   if (!env.LLM_API_KEY) throw new Error('LLM_API_KEY not configured');
 
   const langfuse = beginLangfuseGeneration({
-    name: traceMeta.name || 'requestLLM', model, input: prompt, temperature, traceMeta,
+    name: traceMeta.name || 'requestLLM', model, input: toLLMMessages(prompt), temperature, traceMeta,
   }, env, ctx);
   try {
   const response = await fetchLLM(env, {
     model,
-    messages: [{ role: 'user', content: prompt }],
+    messages: toLLMMessages(prompt),
     response_format: { type: 'json_object' },
     temperature
   });
@@ -661,12 +713,12 @@ async function requestLLM(prompt, env, model = deepModel(env), temperature = 0.5
 async function requestLLMText(prompt, env, model = deepModel(env), temperature = 0.65, ctx, traceMeta = {}) {
   if (!env.LLM_API_KEY) throw new Error('LLM_API_KEY not configured');
   const langfuse = beginLangfuseGeneration({
-    name: traceMeta.name || 'requestLLMText', model, input: prompt, temperature, traceMeta,
+    name: traceMeta.name || 'requestLLMText', model, input: toLLMMessages(prompt), temperature, traceMeta,
   }, env, ctx);
   try {
   const response = await fetchLLM(env, {
     model,
-    messages: [{ role: 'user', content: prompt }],
+    messages: toLLMMessages(prompt),
     temperature,
     stream: false,
   });
@@ -693,14 +745,14 @@ async function requestLLMText(prompt, env, model = deepModel(env), temperature =
 async function* requestLLMSimpleStream(prompt, env, model = deepModel(env), temperature = 0.65, ctx, traceMeta = {}) {
   if (!env.LLM_API_KEY) throw new Error('LLM_API_KEY not configured');
   const langfuse = beginLangfuseGeneration({
-    name: traceMeta.name || 'requestLLMSimpleStream', model, input: prompt, temperature, traceMeta,
+    name: traceMeta.name || 'requestLLMSimpleStream', model, input: toLLMMessages(prompt), temperature, traceMeta,
   }, env, ctx);
   let fullOutput = '';
 
   try {
   const response = await fetchLLM(env, {
     model,
-    messages: [{ role: 'user', content: prompt }],
+    messages: toLLMMessages(prompt),
     temperature,
     stream: true,
     stream_options: { include_usage: true }
@@ -783,23 +835,23 @@ function convertPromptToTextMode(prompt, mode = "status") {
   const fields = baziTextFields(mode);
   const proseBlocks = fields.map(([k, path]) => {
     const desc = k === 'title'
-      ? `（取自上面 Schema 的 ${path}：6-14字标题，点明问题类型与核心结论；不加标点结尾，不写字段名）`
-      : `（取自上面 Schema 的 ${path}：严格遵守该字段的字数与语义；面向用户，可 **加粗**，不写字段名、不写 JSON）`;
+      ? `（取自上面字段定义的 ${path}：6-14字标题，点明问题类型与核心结论；不加标点结尾，不写字段名）`
+      : `（取自上面字段定义的 ${path}：严格遵守该字段的字数与语义；面向用户，可 **加粗**，不写字段名、不写 JSON）`;
     return "<<<SEC:" + k + ">>>\n" + desc + "\n<<<END:" + k + ">>>";
   }).join("\n\n");
-  const WRAP = "\n\n**【最终输出格式（覆盖前文“严格返回统一 envelope / 直接输出 JSON”的方式要求；字段名、字数、语义仍严格遵守上面的“输出 JSON Schema”）】**\n" +
-    "不要直接输出完整 JSON。改为按下列哨兵分段输出。\n\n" +
+  const WRAP = "\n\n**【输出格式】**\n" +
+    "按下列哨兵分段输出；字段名、字数、语义遵守上面的“输出字段定义”。\n\n" +
     "【标记纪律（必须严格遵守，否则前端无法解析）】\n" +
     "- 标记逐字书写，含尖括号与冒号，形如 <<<SEC:summary_conclusion>>> 与 <<<END:summary_conclusion>>>。\n" +
     "- 每段开始标记 <<<SEC:key>>> 与结束标记 <<<END:key>>> 的 key 必须完全相同，绝不能开一个 key 用另一个 key 收尾。\n" +
     "- 标记独占一行、内部不加空格或变体；标记之外、各段之间不写任何多余文字。\n\n" +
-    "【散文段样式纪律（直接面向用户、逐字流式显示，内容取自上面 Schema 对应字段）】\n" +
+    "【散文段样式纪律（直接面向用户、逐字流式显示，内容取自上面字段定义的对应字段）】\n" +
     "- 只允许 **加粗** 这一种 markdown：成对、不嵌套、不跨行，加粗内不含 *；每段最多加粗 1-2 处关键词，不要满屏加粗。\n" +
     "- 禁止其它任何 markdown 或符号：不写 #、- 、* 、1. 等列表/标题符号，不写 > 引用、` 反引号、[]() 链接、表格、字段名、JSON。\n\n" +
     proseBlocks + "\n\n" +
-    "最后输出一个 data_json 段，放入上面 Schema 中【除上述散文段之外的所有字段】（meta、key_signals、readings 的结构/数组字段如 signals/target_state/phenomena/trigger_windows/structural_supports/path_readings 等、rhythm、action_guide.items）；summary 的 title/conclusion/basis 已在散文段输出，不要在 data_json 里重复。字段名与上面 Schema 完全一致。\n" +
+    "最后输出一个 data_json 段，放入上面字段定义中【除上述散文段之外的所有字段】（meta、key_signals、readings 的结构/数组字段如 signals/target_state/phenomena/trigger_windows/structural_supports/path_readings 等、rhythm、action_guide.items）；summary 的 title/conclusion/basis 已在散文段输出，不要在 data_json 里重复。字段名与上面字段定义完全一致。\n" +
     "**格式硬约束**：标记之间只放一个合法 JSON 对象——第一个非空字符必须是 {，最后一个非空字符必须是 }；禁止用 ``` 代码围栏包裹，禁止写 json 前缀，禁止在 JSON 前后写任何说明文字。\n" +
-    "<<<SEC:data_json>>>\n{ ...上面 Schema 中除散文段外的全部字段... }\n<<<END:data_json>>>\n\n" +
+    "<<<SEC:data_json>>>\n{ ...上面字段定义中除散文段外的全部字段... }\n<<<END:data_json>>>\n\n" +
     "严格要求：只输出上述各段，散文段不得为空。";
   return prompt + WRAP;
 }
@@ -831,92 +883,6 @@ function reconstructBaziLlmJson(sections, mode = "status") {
     out.readings.do_not_overclaim = "以上为十神五行和宫位状态呈现的人物倾向，不等于现实中对方一定如此。";
   }
   return out;
-}
-
-// Replaces the qimen JSON output contract block with a plain-text output instruction.
-function convertQimenPromptToTextMode(prompt) {
-  // 哨兵分段混合格式：7 个面向用户的散文段（流式可见）+ 1 个 JSON 尾段（承载结构/审计字段）。
-  // 字段含义、字数、语义约束仍严格遵守前文 qimen_report 各模块说明，本段只改变承载格式。
-  const SENTINEL_INSTRUCTION = `**【最终输出格式（本段覆盖前文所有关于 JSON / 输出字段契约的“格式”要求；字段含义、字数与语义约束仍严格遵守前文 qimen_report 各模块说明）】**
-
-请严格按以下顺序输出 9 个段落，每段用哨兵标记原样包裹。
-
-**【标记纪律（必须严格遵守，否则前端无法解析）】**
-- 标记逐字书写，含尖括号与冒号，形如 <<<SEC:conclusion>>> 与 <<<END:conclusion>>>。
-- 每段的开始标记 <<<SEC:key>>> 与结束标记 <<<END:key>>> 的 key 必须完全相同；绝不能开一个 key 而用另一个 key 收尾（如开 <<<SEC:target_reading>>> 却写 <<<END:subject_reading>>>）。
-- 标记本身独占一行，标记内不要加空格、换行或任何变体；标记之外、各段之间不要写任何多余文字。
-
-**【散文段样式纪律（前 8 段，直接面向用户）】**
-- 只允许 **加粗** 这一种 markdown：必须成对、不嵌套、不跨行，加粗内不含 *；每段最多加粗 1-2 处关键词，不要满屏加粗。
-- 禁止使用其它任何 markdown 或符号：不要写 #、- 、* 、1. 等列表/标题符号，不要写 > 引用、\` 反引号、[]() 链接、表格、字段名。
-- 用自然成段的中文叙述，需要分行时直接换行即可，不要用符号模拟排版。
-
-<<<SEC:conclusion>>>
-（m1_conclusion.conclusion：35-80字总判，开门见山回答用户问题）
-<<<END:conclusion>>>
-
-<<<SEC:subject_reading>>>
-（m3_inference.subject_state.reading：80-140字，日干落宫的门星神、旺衰/空亡/马星如何影响求测人行动状态）
-<<<END:subject_reading>>>
-
-<<<SEC:target_reading>>>
-（m3_inference.target_state.reading：80-140字，领域核心用神落宫、临何门，旺衰与空亡如何影响目标事态）
-<<<END:target_reading>>>
-
-<<<SEC:environment_reading>>>
-（m3_inference.environment_state.reading：90-150字，值使门、值符宫位、宏观资源或流程管道的现实含义）
-<<<END:environment_reading>>>
-
-<<<SEC:support_summary>>>
-（m3_inference.support_factors.summary：45-90字，有利因素综述，把主要依据融合进结论，讲人话）
-<<<END:support_summary>>>
-
-<<<SEC:constraint_summary>>>
-（m3_inference.constraint_factors.summary：45-90字，不利因素综述，不恐吓、不写”必败”）
-<<<END:constraint_summary>>>
-
-<<<SEC:decision_reading>>>
-（m3_inference.interaction_decision.reading：80-140字，引用主客 subject↔target 生克，给方向性判断与现实动作边界）
-<<<END:decision_reading>>>
-
-<<<SEC:title>>>
-（m1_conclusion.title：8-14字，点明问题类型与核心判断；不写字段名，不加标点结尾）
-<<<END:title>>>
-
-<<<SEC:data_json>>>
-本段用 JSON 承载结构化字段，便于后端解析；它不会作为流式散文逐字显示，但其中所有文本字段（verdict、evidence、impact、do、avoid、reason、actions 等）都会渲染进用户最终看到的卡片，必须按前文字数与文案质量要求认真书写，不得敷衍或留空占位。
-**格式硬约束**：标记之间只放一个合法 JSON 对象——第一个非空字符必须是 {，最后一个非空字符必须是 }；禁止用 \`\`\` 代码围栏包裹，禁止写 json 前缀，禁止在 JSON 前后写任何说明文字。必须包含以下结构（字段约束同前文）：
-{
-  "m1_conclusion": { "keyword": "4-12字核心判断词", "actions": ["3条，45-95字，动词开头，可落地，至少1条融合后端应期/时间检索；若无明确窗口说明先观察哪些触发条件", "第2条", "第3条"] },
-  "m2_basis": { "yongshen_cards": [ { "key": "subject|target|environment 或后端 axis key", "label": "卡片标题", "symbol": "如 日干 戊", "tone": "positive|mixed|warning", "verdict": "一句话状态", "evidence": "引用实际落宫/门/星/神/空亡/马星/有名格" } ] },
-  "m3_inference": {
-    "subject_state": { "symbol": "如 日干 辛", "palace": "如 震3宫", "tone": "positive|mixed|warning" },
-    "target_state": { "symbol": "", "palace": "", "tone": "" },
-    "environment_state": { "symbol": "如 值使门", "palace": "", "tone": "" },
-    "support_factors": { "tone": "positive", "items": [ { "name": "要素名", "impact": "45-90字影响说明" } ] },
-    "constraint_factors": { "tone": "warning", "items": [ { "name": "要素名", "impact": "45-90字影响说明" } ] },
-    "interaction_decision": { "subject_symbol": "如 日干", "target_symbol": "如 时干", "tone": "positive|mixed|warning" }
-  },
-  "m4_guidance": {
-    "environment_fengshui": { "suitable_direction": "宜用方位/坐向", "do": "环境布置或沟通场景", "avoid": "应避开的方位/环境", "reason": "盘面依据" },
-    "timing_behavior": { "window": "只用后端应期候选，或写“暂无明确窗口”", "wait_until": "可选触发条件", "do": "该窗口内动作", "avoid": "时机上的避坑", "reason": "为何是观察/启动窗口，不保证必然落地" }
-  },
-  "score_review": { "audit_delta": 0, "confidence": "low|medium|high", "role_review": "审计 role 是否合理", "layer_reviews": "逐层说明是否需修正", "audit_delta_breakdown": "audit_delta 落在哪些层", "missed_or_overweighted_factors": ["后端漏判/误判/过重/过轻的因素"], "audit_reason": "用自然语言说明修正原因" },
-  "intent_audit": { "route_confidence": "high|medium|low", "is_route_acceptable": true, "is_role_acceptable": true, "suggested_category": "", "suggested_subcategory": "", "suggested_role": "", "reason": "" },
-  "timing_review": { "summary": "评价后端应期候选是否可用", "usable_candidates": [], "limitations": [] }
-}
-其中 score_review.audit_delta 必须写整数 0；模型复核只提供文字意见，不改动后端确定性工程指标。
-<<<END:data_json>>>
-
-严格要求：只输出上述 9 段，不要在哨兵标记之外写任何文字。`;
-
-  // 替换 JSON 输出契约段，但保留契约段之后的“问题：…”尾部（原实现会误删它）。
-  const contractAnchor = '**【输出字段契约】**';
-  const idx = prompt.indexOf(contractAnchor);
-  if (idx === -1) return prompt + '\n\n' + SENTINEL_INSTRUCTION;
-  const qIdx = prompt.indexOf('问题：', idx);
-  const trailing = qIdx !== -1 ? prompt.slice(qIdx) : '';
-  return prompt.slice(0, idx) + SENTINEL_INSTRUCTION + (trailing ? '\n\n' + trailing : '');
 }
 
 // Incremental parser for <<<SEC:key>>> ... <<<END:key>>> sentinel sections.
@@ -1037,16 +1003,32 @@ function baziSectionsAreBad(sec, mode) {
   return false;
 }
 
+// 英文请求：可见正文段任一段不是英文 → 按结构不合格处理（spec T3.3）。中文请求恒为 false，不多调模型。
+function proseLocaleIsBad(sec, keys, contentLocale) {
+  if (contentLocale !== 'en-US' || !sec) return false;
+  return !detectProseLocale.sectionsMatchLocale(keys.map((k) => sec[k]).filter(Boolean), contentLocale);
+}
+
+// JSON 型接口（日运、月运、纠偏）：英文请求下文本字段不是英文就重试一次；仍不对则照常返回并标 mixed。
+async function requestLLMInLocale(prompt, env, model, temperature, ctx, traceMeta, contentLocale) {
+  const { result, mixed, attempts } = await detectProseLocale.withLocaleRetry(
+    (attempt) => requestLLM(prompt, env, model, temperature, ctx, attempt ? { ...traceMeta, name: `${traceMeta?.name || 'requestLLM'}-locale-retry` } : traceMeta),
+    { contentLocale },
+  );
+  if (attempts > 1) console.warn('[i18n] JSON output not in requested language, retried once', { trace: traceMeta?.name, contentLocale, mixed });
+  return { llmJson: result, mixed };
+}
+
 async function requestLLMStreamSections(prompt, env, handlers = {}, model = deepModel(env), temperature = 0.65, ctx, traceMeta = {}) {
   if (!env.LLM_API_KEY) throw new Error('LLM_API_KEY not configured');
   const langfuse = beginLangfuseGeneration({
-    name: traceMeta.name || 'requestLLMStreamSections', model, input: prompt, temperature, traceMeta,
+    name: traceMeta.name || 'requestLLMStreamSections', model, input: toLLMMessages(prompt), temperature, traceMeta,
   }, env, ctx);
 
   try {
   const response = await fetchLLM(env, {
     model,
-    messages: [{ role: 'user', content: prompt }],
+    messages: toLLMMessages(prompt),
     temperature,
     stream: true,
     stream_options: { include_usage: true }
@@ -1300,7 +1282,7 @@ async function handleFortuneDaily(request, env) {
     return response;
   } catch (error) {
     console.error('[qimen-api] fortune-daily error:', error);
-    const isQuota = error.message.includes('额度');
+    const isQuota = error.code === 'QUOTA_EXCEEDED';
     return json({ error: isQuota ? error.message : '云端日运推演失败', details: error.message }, { status: error.status || (isQuota ? 403 : 500) }, request, env);
   }
 }
@@ -1354,6 +1336,7 @@ async function handleBaziQuestion(request, env, ctx) {
 
   const userToken = request.headers.get('Authorization')?.replace('Bearer ', '');
   const body = await readJson(request);
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale });
   const question = String(body.question || '').trim();
   const profileId = String(body.profileId || '').trim();
   if (!question) return json({ error: '问题不能为空' }, { status: 400 }, request, env);
@@ -1375,13 +1358,12 @@ async function handleBaziQuestion(request, env, ctx) {
     const baseRoute = normalizeDivinationRoute({ branch: 'bazi', category: 'general', ...requestRoute });
 
     // ── SSE Step 0: 解析问题意图 (routing was done by client) ──
-    const _cat0 = QIMEN_CATEGORY_LABELS[baseRoute.category] || '综合运势';
-    emit({ type: 'step', index: 0, pct: 10, chip: { main: _cat0, sub: '八字命理' } });
+    emit({ type: 'step', index: 0, pct: 10, chip: sseChips.baziCategoryChip(baseRoute.category) });
 
     // ── SSE Step 1: 调取命盘完成 ──
     const dayMaster = profile.bazi_detail?.day_master || profile.bazi_str?.split(' ')?.[2]?.[0] || '日主';
     const strengthLabel = profile.bazi_detail?.strength_label || '';
-    emit({ type: 'step', index: 1, pct: 22, chip: { main: `日主${dayMaster}`, sub: strengthLabel || '命盘就绪' } });
+    emit({ type: 'step', index: 1, pct: 22, chip: sseChips.baziDayMasterChip(dayMaster, strengthLabel) });
 
     const cheapRouteHint = ruleRouteHint(question, { forceBranch: baseRoute.branch === 'hybrid' ? 'hybrid' : 'bazi' });
     const routeHint = {
@@ -1430,25 +1412,20 @@ async function handleBaziQuestion(request, env, ctx) {
     }
 
     // ── SSE Step 2: 语义路由完成 ──
-    const _BAZI_MODE_CN = { timing: '时间推演', pattern: '格局分析', character: '性格命理', status: '当下状态' };
-    const _modeLabel = _BAZI_MODE_CN[semanticRoute.analysis_mode] || '分析模式';
-    const _modeSub   = _BAZI_MODE_CN[semanticRoute.analysis_mode] ? (semanticRoute.branch === 'hybrid' ? '综合推演' : '八字命理') : '命理分析';
-    emit({ type: 'step', index: 2, pct: 36, chip: { main: _modeLabel, sub: _modeSub } });
+    emit({ type: 'step', index: 2, pct: 36, chip: sseChips.baziModeChip(semanticRoute.analysis_mode, semanticRoute.branch) });
 
     const { prompt, pipelineResult } = buildBaziQuestionPrompt({ profile, question, route: semanticRoute });
 
     // ── SSE Step 3: 构建推演框架完成 ──
-    const _SCOPE_CN = { current_year: '今年', next_3_years: '近三年', next_5_years: '近五年', next_10_years: '未来十年', unknown: '命局综合' };
     const _scopeType = semanticRoute.time_scope?.type || 'unknown';
     const _scopeYears = semanticRoute.time_scope?.start_year && semanticRoute.time_scope?.end_year
       ? `${semanticRoute.time_scope.start_year}–${semanticRoute.time_scope.end_year}`
       : null;
-    const _scopeMain = _SCOPE_CN[_scopeType] || '命局综合';
-    emit({ type: 'step', index: 3, pct: 48, chip: { main: _scopeMain, sub: _scopeYears || '命局推演' } });
+    emit({ type: 'step', index: 3, pct: 48, chip: sseChips.baziScopeChip(_scopeType, _scopeYears) });
 
     // ── SSE Step 4: 五行喜忌 (instant — derived from pipelineResult) ──
     const _favorable = pipelineResult?.favorable_elements?.join('') || pipelineResult?.favorable || '';
-    emit({ type: 'step', index: 4, pct: 62, chip: _favorable ? { main: `喜${_favorable}`, sub: '忌神已标记' } : null });
+    emit({ type: 'step', index: 4, pct: 62, chip: sseChips.baziFavorableChip(_favorable) });
 
     // ── Engine complete: emit pre-LLM structured data for immediate frontend display ──
     const subject_snapshot = {
@@ -1477,12 +1454,7 @@ async function handleBaziQuestion(request, env, ctx) {
         subcategory: semanticRoute.subcategory || '',
         favorable_element: _favEl,
         question,
-        tags: [
-          { label: _cat0 },
-          { label: `日主${dayMaster}` },
-          ...(_favorable ? [{ label: `喜${_favorable}` }] : []),
-          { label: _modeLabel },
-        ],
+        tags: sseChips.baziEngineTags({ category: baseRoute.category, dayMaster, favorable: _favorable, mode: semanticRoute.analysis_mode }),
         stateReport:      pipelineResult?.stateReport      ?? null,
         dynamicReport:    pipelineResult?.dynamicReport    ?? null,
         targetSpec:       pipelineResult?.targetSpec       ?? null,
@@ -1496,36 +1468,42 @@ async function handleBaziQuestion(request, env, ctx) {
     emit({ type: 'active', index: 5, pct: 75 });
 
     const _baziMode = semanticRoute.analysis_mode || 'status';
-    const textPrompt = convertPromptToTextMode(prompt, _baziMode);
+    const textPrompt = outputLanguage.appendOutputLanguage(convertPromptToTextMode(prompt, _baziMode), contentLocale);
     const questionModel = resolveQuestionModel(env);
     let llmFullText = '';
     const baziParser = createSentinelStreamParser(baziVisibleSections(_baziMode), {
       onVisibleDelta: (section, text) => emit({ type: 'llm_delta', section, text })
     });
     const _baziTraceMeta = { name: 'bazi-question-answer', scenario: 'bazi-question', category: semanticRoute.category, analysisMode: _baziMode, tags: ['bazi', `mode:${_baziMode}`], userId: user.id };
-    for await (const chunk of requestLLMSimpleStream(textPrompt, env, questionModel, 0.65, ctx, _baziTraceMeta)) {
+    for await (const chunk of requestLLMSimpleStream(textPrompt, env, questionModel, BAZI_ANSWER_TEMPERATURE, ctx, _baziTraceMeta)) {
       llmFullText += chunk;
       baziParser.push(chunk);
     }
     // 结构校验：空流 / 核心段缺失 / data_json 不可解析 → 打回让 LLM 重试一次（非流式）
     let baziSec = baziParser.finish();
-    if (baziSectionsAreBad(baziSec, _baziMode)) {
+    const BAZI_PROSE_KEYS = baziTextFields(_baziMode).map(([k]) => k);
+    let outputLocaleMixed = false;
+    if (baziSectionsAreBad(baziSec, _baziMode) || proseLocaleIsBad(baziSec, BAZI_PROSE_KEYS, contentLocale)) {
       console.warn('[bazi-question] bad structure, retrying non-streaming...', { mode: _baziMode, len: llmFullText.length });
       // 通知前端清空已显示的半截内容，重置回骨架
-      emit({ type: 'llm_retry', message: 'AI 重新推演中…' });
+      emit({ type: 'llm_retry', message: 'AI 重新推演中…', messageKey: 'sse.llmRetry' });
       try {
-        llmFullText = await requestLLMText(textPrompt, env, questionModel, 0.65, ctx, { ..._baziTraceMeta, name: 'bazi-question-answer-retry' });
+        llmFullText = await requestLLMText(textPrompt, env, questionModel, BAZI_ANSWER_TEMPERATURE, ctx, { ..._baziTraceMeta, name: 'bazi-question-answer-retry' });
       } catch (retryErr) {
         console.error('[bazi-question] retry also failed:', retryErr.message);
-        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试', code: 'LLM_UNAVAILABLE' });
         return;
       }
       const retryBaziParser = createSentinelStreamParser(baziVisibleSections(_baziMode), {});
       retryBaziParser.push(llmFullText);
       baziSec = retryBaziParser.finish();
       if (baziSectionsAreBad(baziSec, _baziMode)) {
-        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试', code: 'LLM_UNAVAILABLE' });
         return;
+      }
+      if (proseLocaleIsBad(baziSec, BAZI_PROSE_KEYS, contentLocale)) {
+        outputLocaleMixed = true;
+        console.warn('[i18n] output locale mismatch after retry', { trace: 'bazi-question-answer-retry', contentLocale });
       }
       for (const [k] of baziTextFields(_baziMode)) {
         if (baziSec[k]) emit({ type: 'llm_delta', section: k, text: baziSec[k] });
@@ -1570,6 +1548,7 @@ async function handleBaziQuestion(request, env, ctx) {
     });
 
     try {
+      Object.assign(auditSnapshot, getRequestGeo(request, body));
       const auditSupabase = createSupabaseClient(env);
       const { error: auditError } = await auditSupabase.from('bazi_question_audit').insert(auditSnapshot);
       if (auditError) console.warn('[qimen-api] bazi audit insert failed:', auditError.message || auditError);
@@ -1582,6 +1561,8 @@ async function handleBaziQuestion(request, env, ctx) {
       llmText: llmFullText,
       favorable_element: _favEl,
       subject_snapshot,
+      output_locale: contentLocale,
+      ...(outputLocaleMixed ? { output_locale_actual: 'mixed' } : {}),
       five_shens,
       ...(pipelineResult ? {
         state_report: pipelineResult.stateReport || null,
@@ -1593,7 +1574,7 @@ async function handleBaziQuestion(request, env, ctx) {
     emit({ type: 'complete', result: outputWithSnapshot });
   } catch (error) {
     console.error('[qimen-api] bazi-question error:', error);
-    emit({ type: 'error', message: error.message || '八字问答生成失败' });
+    emit({ type: 'error', message: error.message || '八字问答生成失败', code: error.code || serverMessages.inferErrorCode(error.message, error.status || 500) });
   } finally {
     close();
   }
@@ -1641,16 +1622,16 @@ async function handleBaziCalibrate(request, env, ctx) {
   try {
     const user = await getAuthedUser(request, env);
     const body = await readJson(request);
-    const { profileId, prompt } = body;
-    if (!profileId || !prompt) return json({ error: '缺少 profileId 或 prompt' }, { status: 400 }, request, env);
-    // 该 prompt 在前端拼好（见 src/utils/buildCalibrationPrompt.mjs），内含用户填写的人生大事
-    // 自由描述（可能涉及婚姻/疾病/官司等隐私内容），上报 Langfuse 时不传原文，只传统计摘要。
-    const _calibrateTraceInput = JSON.stringify({ profileId, promptLength: prompt.length });
+    const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale });
+    // prompt 由 Worker 按数据库里的档案与人生事件组装（lib/baziCalibrationPrompt.js）；
+    // 不再接收前端传来的 prompt，避免接口被用来向付费模型发送任意内容。
+    const { profileId } = body;
+    if (!profileId) return json({ error: '缺少 profileId' }, { status: 400 }, request, env);
 
     const supabase = createSupabaseClient(env);
     const { data: profile, error: profileError } = await supabase
       .from('bazi_profiles')
-      .select('id, user_id, life_events, calibrated_yuanju_core, calibrated_current_dayun, calibrated_current_liunian, calibrated_version')
+      .select(`${BAZI_PROFILE_BASE_FIELDS}, life_events, calibrated_yuanju_core, calibrated_current_dayun, calibrated_current_liunian, calibrated_version`)
       .eq('id', profileId)
       .single();
     if (profileError) {
@@ -1671,9 +1652,15 @@ async function handleBaziCalibrate(request, env, ctx) {
       }, { status: 200 }, request, env);
     }
 
-    const llmJson = await requestLLM(prompt, env, deepModel(env), 0.2, ctx, {
+    const lifeEvents = Array.isArray(profile.life_events) ? profile.life_events : [];
+    if (!lifeEvents.length) return json({ error: '还没有填写人生大事，无法校准' }, { status: 400 }, request, env);
+    const prompt = outputLanguage.appendOutputLanguage(buildCalibrationPrompt(profile, lifeEvents, { now: getBeijingDayInfo().bjTime }), contentLocale);
+    // 人生大事自由描述可能涉及婚姻/疾病/官司等隐私内容，上报 Langfuse 时不传原文，只传统计摘要。
+    const _calibrateTraceInput = JSON.stringify({ profileId, eventCount: lifeEvents.length, promptLength: prompt.length });
+
+    const { llmJson } = await requestLLMInLocale(prompt, env, deepModel(env), 0.2, ctx, {
       name: 'bazi-calibrate', scenario: 'bazi-calibrate', traceInputOverride: _calibrateTraceInput, userId: user.id,
-    });
+    }, contentLocale);
     if (!llmJson.yuanju_core || !llmJson.current_dayun || !llmJson.current_liunian) {
       return json({ error: 'LLM 返回格式不符预期' }, { status: 500 }, request, env);
     }
@@ -1706,13 +1693,15 @@ async function handleFortuneDailyInterpretation(request, env, ctx) {
   const url = new URL(request.url);
   let body = {};
   if (request.method === 'POST') body = await readJson(request);
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale, queryLocale: url?.searchParams?.get('locale') });
 
   try {
     const user = await getAuthedUser(request, env);
     const targetDate = getTargetDate(url, body);
     const { bjTime, todayKey, expiresAt } = getBeijingDayInfo(targetDate);
     const requestedProfileId = getRequestedProfileId(url, body);
-    const periodKey = buildDailyPeriodKey(todayKey, requestedProfileId);
+    // 英文断语与中文分开缓存（§5.9）；简体键不变
+    const periodKey = buildDailyPeriodKey(todayKey, requestedProfileId, contentLocale);
 
     const cached = await getCachedFortune(user.id, 'day', periodKey, env);
     if (hasReadyInterpretation(cached)) return json(pickInterpretationFields(cached), { status: 200 }, request, env);
@@ -1724,15 +1713,15 @@ async function handleFortuneDailyInterpretation(request, env, ctx) {
     const latestBaseJson = buildBaseFortunePayload(context);
     const baseJson = cached ? { ...cached, ...latestBaseJson } : latestBaseJson;
     
-    const prompt = buildInterpretationPrompt(context);
-    const llmJson = await requestLLM(prompt, env, fastModel(env), 0.5, ctx, { name: 'fortune-daily-interpretation', scenario: 'fortune-daily', userId: user.id });
-    const mergedJson = mergeInterpretation(baseJson, llmJson);
+    const prompt = outputLanguage.appendOutputLanguage(buildInterpretationPrompt(context), contentLocale);
+    const { llmJson, mixed } = await requestLLMInLocale(prompt, env, fastModel(env), 0.5, ctx, { name: 'fortune-daily-interpretation', scenario: 'fortune-daily', userId: user.id }, contentLocale);
+    const mergedJson = { ...mergeInterpretation(baseJson, llmJson), output_locale: contentLocale, ...(mixed ? { output_locale_actual: 'mixed' } : {}) };
 
     await upsertFortuneCache(user.id, 'day', periodKey, mergedJson, expiresAt, env);
     return json(pickInterpretationFields(mergedJson), { status: 200 }, request, env);
   } catch (error) {
     console.error('[qimen-api] fortune-daily-interpretation error:', error);
-    const isQuota = error.message.includes('额度');
+    const isQuota = error.code === 'QUOTA_EXCEEDED';
     return json({ error: isQuota ? error.message : '云端日运断语生成失败', details: error.message }, { status: error.status || (isQuota ? 403 : 500) }, request, env);
   }
 }
@@ -1742,6 +1731,7 @@ async function handleFortuneMonthlyInterpretation(request, env, ctx) {
   const url = new URL(request.url);
   let body = {};
   if (request.method === 'POST') body = await readJson(request);
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale, queryLocale: url?.searchParams?.get('locale') });
 
   try {
     const user = await getAuthedUser(request, env);
@@ -1754,20 +1744,20 @@ async function handleFortuneMonthlyInterpretation(request, env, ctx) {
     const profileContext = await getProfileContext(profile.id, env);
     const { record: currentMonthlyContext, recent_records: recentMonthlyContexts } = await getMonthlyContext(profile.id, flowMonth.context_month_key, env);
     const contextSeed = buildContextVersionSeed(profileContext, recentMonthlyContexts);
-    const periodKey = buildMonthlyInterpretationPeriodKey(flowMonth.period_key, profile.id, dimension, contextSeed);
+    const periodKey = buildMonthlyInterpretationPeriodKey(flowMonth.period_key, profile.id, dimension, contextSeed, contentLocale);
 
     const cached = await getCachedFortune(user.id, 'month_interpretation', periodKey, env);
     if (hasReadyMonthlyInterpretation(cached)) return json(pickMonthlyInterpretationFields(cached), { status: 200 }, request, env);
 
     const baseJson = buildMonthlyFortunePayload(profile, flowMonth);
-    const prompt = buildMonthlyInterpretationPrompt(profile, baseJson, dimension, {
+    const prompt = outputLanguage.appendOutputLanguage(buildMonthlyInterpretationPrompt(profile, baseJson, dimension, {
       profile_context: profileContext,
       current_monthly_context: currentMonthlyContext,
       recent_monthly_contexts: recentMonthlyContexts,
-    });
+    }), contentLocale);
     
-    const llmJson = await requestLLM(prompt, env, fastModel(env), 0.5, ctx, { name: 'fortune-monthly-interpretation', scenario: 'fortune-monthly', dimension, userId: user.id });
-    const mergedJson = mergeMonthlyInterpretation(baseJson, llmJson, dimension);
+    const { llmJson, mixed } = await requestLLMInLocale(prompt, env, fastModel(env), 0.5, ctx, { name: 'fortune-monthly-interpretation', scenario: 'fortune-monthly', dimension, userId: user.id }, contentLocale);
+    const mergedJson = { ...mergeMonthlyInterpretation(baseJson, llmJson, dimension), output_locale: contentLocale, ...(mixed ? { output_locale_actual: 'mixed' } : {}) };
 
     await upsertFortuneCache(user.id, 'month_interpretation', periodKey, mergedJson, flowMonth.expiresAt, env);
     return json(pickMonthlyInterpretationFields(mergedJson), { status: 200 }, request, env);
@@ -1844,6 +1834,8 @@ async function handleQimenFollowup(request, env, ctx) {
   const followup = String(body.followup || '').trim();
   const branch = body.branch === 'bazi' ? 'bazi' : 'qimen';
   const origin = body.origin && typeof body.origin === 'object' ? body.origin : {};
+  // 追问跟原报告同语言（spec T3.5）：优先 origin.output_locale，其次本次请求的界面语言。
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.originLocale || origin.output_locale || body?.locale });
   if (!followup) return json({ error: '追问不能为空' }, { status: 400 }, request, env);
   if (!origin.evidence) return json({ error: '缺少原局上下文（evidence）' }, { status: 400 }, request, env);
 
@@ -1903,7 +1895,7 @@ async function handleQimenFollowup(request, env, ctx) {
     // ── Step B: 增补 patch（与问事同档模型，哨兵分段流式）──
     emit({ type: 'followup_step', stage: 'patch', target_sections: fr.target_sections, nature: fr.nature });
     const patchModel = resolveQuestionModel(env);
-    const patchPrompt = buildFollowupPatchPrompt({
+    const patchPrompt = outputLanguage.appendOutputLanguage(buildFollowupPatchPrompt({
       branch,
       followup,
       evidence: origin.evidence,
@@ -1911,7 +1903,7 @@ async function handleQimenFollowup(request, env, ctx) {
       sections,
       targetSections: fr.target_sections,
       nature: fr.nature,
-    });
+    }), contentLocale);
     if (env.FOLLOWUP_DEBUG === '1') console.log('[followup][prompt:patch]\n' + patchPrompt);
 
     const visible = new Set(fr.target_sections);
@@ -1920,7 +1912,7 @@ async function handleQimenFollowup(request, env, ctx) {
     });
     const _followupTraceMeta = { name: 'qimen-followup-patch', scenario: 'qimen-followup', branch, nature: fr.nature, tags: ['qimen-followup'], userId: userId || guestId, sessionId: recordId || requestId };
     let full = '';
-    for await (const chunk of requestLLMSimpleStream(patchPrompt, env, patchModel, 0.6, ctx, _followupTraceMeta)) {
+    for await (const chunk of requestLLMSimpleStream(patchPrompt, env, patchModel, FOLLOWUP_TEMPERATURE, ctx, _followupTraceMeta)) {
       full += chunk;
       parser.push(chunk);
     }
@@ -1928,17 +1920,18 @@ async function handleQimenFollowup(request, env, ctx) {
 
     // 兜底：目标段全空 → 非流式重试一次
     const hasAny = fr.target_sections.some((k) => sec[k] && sec[k].trim());
-    if (!hasAny) {
-      console.warn('[followup] empty patch, retrying non-streaming...');
+    if (!hasAny || proseLocaleIsBad(sec, fr.target_sections, contentLocale)) {
+      console.warn('[followup] empty patch or wrong language, retrying non-streaming...', { contentLocale });
       emit({ type: 'patch_retry' });
       try {
-        full = await requestLLMText(patchPrompt, env, patchModel, 0.6, ctx, { ..._followupTraceMeta, name: 'qimen-followup-patch-retry' });
+        full = await requestLLMText(patchPrompt, env, patchModel, FOLLOWUP_TEMPERATURE, ctx, { ..._followupTraceMeta, name: 'qimen-followup-patch-retry' });
         const retry = createSentinelStreamParser(visible, {});
         retry.push(full);
         sec = retry.finish();
+        if (proseLocaleIsBad(sec, fr.target_sections, contentLocale)) console.warn('[i18n] output locale mismatch after retry', { trace: 'qimen-followup-patch-retry', contentLocale });
         for (const k of fr.target_sections) if (sec[k]) emit({ type: 'patch_delta', section: k, text: sec[k] });
       } catch (e) {
-        emit({ type: 'error', message: '追问生成暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: '追问生成暂时不可用，请稍后重试', code: 'FOLLOWUP_UNAVAILABLE' });
         return;
       }
     }
@@ -1966,7 +1959,7 @@ async function handleQimenFollowup(request, env, ctx) {
     });
   } catch (error) {
     console.error('[qimen-api] followup error:', error);
-    emit({ type: 'error', message: error.message || '追问生成失败' });
+    emit({ type: 'error', message: error.message || '追问生成失败', code: error.code || serverMessages.inferErrorCode(error.message, error.status || 500) });
   } finally {
     close();
   }
@@ -2000,6 +1993,7 @@ async function handleBaziFollowup(request, env, ctx) {
   const body = await readJson(request);
   const followup = String(body.followup || '').trim();
   const origin = body.origin && typeof body.origin === 'object' ? body.origin : {};
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.originLocale || origin.output_locale || body?.locale });
   const profileId = String(origin.profileId || origin.profile_id || '').trim();
   if (!followup) return json({ error: '追问不能为空' }, { status: 400 }, request, env);
   if (!profileId) return json({ error: '缺少八字档案 ID（origin.profileId）' }, { status: 400 }, request, env);
@@ -2037,9 +2031,10 @@ async function handleBaziFollowup(request, env, ctx) {
     // ── 主 LLM 第一跳：决策 prompt（answer / recompute / new_matter）──
     emit({ type: 'followup_step', stage: 'decide' });
     const model = resolveQuestionModel(env);
-    const prompt = buildBaziFollowupPrompt({
+    const prompt = outputLanguage.appendOutputLanguage(buildBaziFollowupPrompt({
       followup, originQuestion, evidenceText, sections, followups, route: originRoute,
-    });
+      today: getBeijingDayInfo().todayKey,
+    }), contentLocale);
     if (env.FOLLOWUP_DEBUG === '1') console.log('[followup][bazi][prompt]\n' + prompt);
 
     const patchable = PATCHABLE_SECTIONS.bazi;
@@ -2062,7 +2057,7 @@ async function handleBaziFollowup(request, env, ctx) {
 
     const _baziFollowupTraceMeta = { name: 'bazi-followup-decide', scenario: 'bazi-followup', analysisMode: originRoute.analysis_mode, tags: ['bazi-followup'], userId: user.id, sessionId: profileId };
     let full = '';
-    for await (const chunk of requestLLMSimpleStream(prompt, env, model, 0.6, ctx, _baziFollowupTraceMeta)) {
+    for await (const chunk of requestLLMSimpleStream(prompt, env, model, FOLLOWUP_TEMPERATURE, ctx, _baziFollowupTraceMeta)) {
       full += chunk;
       parser.push(chunk);
     }
@@ -2102,17 +2097,19 @@ async function handleBaziFollowup(request, env, ctx) {
     if (!streamed) {
       for (const k of decision.target_sections) if (supplements[k]) emit({ type: 'patch_delta', section: k, text: supplements[k] });
     }
-    // 仍为空 → 非流式重试一次
-    if (!Object.keys(supplements).length) {
-      console.warn('[bazi-followup] empty answer, retrying non-streaming...');
+    // 仍为空，或英文请求下不是英文 → 非流式重试一次
+    if (!Object.keys(supplements).length || proseLocaleIsBad(supplements, Object.keys(supplements), contentLocale)) {
+      console.warn('[bazi-followup] empty answer or wrong language, retrying non-streaming...', { contentLocale });
+      for (const k of Object.keys(supplements)) delete supplements[k];
       emit({ type: 'patch_retry' });
       try {
-        const retryFull = await requestLLMText(prompt, env, model, 0.6, ctx, { ..._baziFollowupTraceMeta, name: 'bazi-followup-decide-retry' });
+        const retryFull = await requestLLMText(prompt, env, model, FOLLOWUP_TEMPERATURE, ctx, { ..._baziFollowupTraceMeta, name: 'bazi-followup-decide-retry' });
         const rp = createSentinelStreamParser(visible, {});
         rp.push(retryFull); const rsec = rp.finish();
         for (const k of patchable) if (rsec[k] && rsec[k].trim()) { supplements[k] = rsec[k].trim(); emit({ type: 'patch_delta', section: k, text: supplements[k] }); }
+        if (proseLocaleIsBad(supplements, Object.keys(supplements), contentLocale)) console.warn('[i18n] output locale mismatch after retry', { trace: 'bazi-followup-decide-retry', contentLocale });
       } catch (e) {
-        emit({ type: 'error', message: '追问生成暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: '追问生成暂时不可用，请稍后重试', code: 'FOLLOWUP_UNAVAILABLE' });
         return;
       }
     }
@@ -2121,7 +2118,7 @@ async function handleBaziFollowup(request, env, ctx) {
     await writeFollowupAudit(env, { ...auditBase, supplements });
   } catch (error) {
     console.error('[bazi-followup] error:', error);
-    emit({ type: 'error', message: error.message || '追问生成失败' });
+    emit({ type: 'error', message: error.message || '追问生成失败', code: error.code || serverMessages.inferErrorCode(error.message, error.status || 500) });
   } finally {
     close();
   }
@@ -2154,6 +2151,8 @@ async function handleQimen(request, env, ctx) {
 
   // Body must be read before SSE starts (Request.body can only be consumed once)
   const body = await readJson(request);
+  // 内容语言（§5.8）：只看请求体里显式的 locale；简体与繁体都是 zh-CN
+  const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale });
 
   // Quota enforcement
   const currentUserEmail = user?.email ? user.email.toLowerCase() : "";
@@ -2169,7 +2168,7 @@ async function handleQimen(request, env, ctx) {
       await assertDailyQimenQuota({ supabase, userId });
     } catch (quotaErr) {
       console.warn('[qimen-api] quota check failed:', quotaErr);
-      return json({ error: quotaErr.message || '额度检查失败' }, { status: quotaErr.status || 500 }, request, env);
+      return json({ error: quotaErr.message || '额度检查失败', ...(quotaErr.code ? { code: quotaErr.code } : {}) }, { status: quotaErr.status || 500 }, request, env);
     }
   }
 
@@ -2207,18 +2206,18 @@ async function handleQimen(request, env, ctx) {
     
     const baziInfo = body.baziInfo || "未提供八字信息";
     const baziHash = baziInfo === "未提供八字信息" ? "NoBazi" : baziInfo.substring(0, 15);
-    const cacheKey = `${year}-${month}-${day}-${ganzhiHour}-${userQuestion}-${baziHash}`;
+    // 英文键尾加后缀，简体键不变（§5.9）
+    const cacheKey = `${year}-${month}-${day}-${ganzhiHour}-${userQuestion}-${baziHash}${contentLocale === 'en-US' ? '-en-US' : ''}`;
     
     if (qimenMemoryCache[cacheKey]) {
       console.log("⚡️ 命中云端时辰缓存！直接返回。");
       const cached = qimenMemoryCache[cacheKey];
-      const cachedCat = QIMEN_CATEGORY_LABELS[cached.category] || '综合运势';
       const cachedScore = cached.backend_score_audit?.final_score ?? cached.summary?.score ?? 72;
-      emit({ type: 'step', index: 0, pct: 10, chip: { main: cachedCat, sub: cached.branch === 'hybrid' ? '综合推演' : '奇门遁甲' } });
+      emit({ type: 'step', index: 0, pct: 10, chip: sseChips.qimenCategoryChip(cached.category, cached.branch) });
       emit({ type: 'step', index: 1, pct: 25, chip: { main: cached.qimen_data?.ju_info?.name || '已起盘', sub: cached.qimen_data?.pillars?.hour || '' } });
       emit({ type: 'step', index: 2, pct: 42, chip: null });
       emit({ type: 'step', index: 3, pct: 58, chip: null });
-      emit({ type: 'step', index: 4, pct: 72, chip: { main: `初分 ${cachedScore}`, sub: QIMEN_SCORE_LABEL(cachedScore) } });
+      emit({ type: 'step', index: 4, pct: 72, chip: sseChips.qimenPreScoreChip(cachedScore) });
       emit({ type: 'step', index: 5, pct: 90, chip: null });
       emit({ type: 'complete', result: cached });
       return;
@@ -2252,17 +2251,13 @@ async function handleQimen(request, env, ctx) {
     } = ev;
 
     // ── SSE 进度：pipeline 已一次算完，按 index 顺序回报（chip 内容与旧版逐字一致）──
-    const _cat0 = QIMEN_CATEGORY_LABELS[detectedIntent.category] || '综合运势';
-    const _sub0 = detectedIntent.branch === 'hybrid' ? '综合推演' : '奇门遁甲';
-    emit({ type: 'step', index: 0, pct: 10, chip: { main: _cat0, sub: _sub0 } });
+    emit({ type: 'step', index: 0, pct: 10, chip: sseChips.qimenCategoryChip(detectedIntent.category, detectedIntent.branch) });
     emit({ type: 'step', index: 1, pct: 25, chip: { main: qimen_structure, sub: ganzhiHour } });
     const _primarySymbol = yongshenRule?.yongshen?.primary?.[0]?.symbol || '用神';
     emit({ type: 'step', index: 2, pct: 42, chip: { main: _primarySymbol, sub: detectedIntent.subcategory || detectedIntent.category || '' } });
     const _windows = timingAnalysis?.p2_scan?.candidates || [];
-    const _firstWin = _windows[0];
-    const _winSub = _firstWin ? (_firstWin.date || '近日') : '暂无明确窗口';
-    emit({ type: 'step', index: 3, pct: 58, chip: { main: `发现 ${_windows.length} 个窗口`, sub: _winSub } });
-    emit({ type: 'step', index: 4, pct: 72, chip: { main: `初分 ${backendScoreAudit.final_score}`, sub: QIMEN_SCORE_LABEL(backendScoreAudit.final_score) } });
+    emit({ type: 'step', index: 3, pct: 58, chip: sseChips.qimenWindowsChip(_windows) });
+    emit({ type: 'step', index: 4, pct: 72, chip: sseChips.qimenPreScoreChip(backendScoreAudit.final_score) });
 
     // ── Engine complete: emit pre-LLM data for immediate frontend display ──
     emit({
@@ -2278,12 +2273,7 @@ async function handleQimen(request, env, ctx) {
         qimen_data: qimenData,
         formation_tags: backendFormationTags,
         timing_window_count: _windows.length,
-        tags: [
-          { label: _cat0 },
-          { label: qimen_structure },
-          { label: `初分${backendScoreAudit.final_score} · ${QIMEN_SCORE_LABEL(backendScoreAudit.final_score)}`, isScore: true },
-          ...(_windows.length ? [{ label: `${_windows.length}个应期窗口` }] : []),
-        ],
+        tags: sseChips.qimenEngineTags({ category: detectedIntent.category, structure: qimen_structure, score: backendScoreAudit.final_score, windowCount: _windows.length }),
       }
     });
 
@@ -2309,74 +2299,45 @@ async function handleQimen(request, env, ctx) {
     const domainViewPromptSection = buildDomainViewPromptSection(yongshenRule);
     const timingPromptSection = buildTimingPromptSection(timingAnalysis);
     const polarityPromptSection = buildPolarityPromptSection(polarityOverrides);
-    const summaryPromptSection = buildSummaryPromptSection();
-    const reportSchemaSection = buildReportSchemaPromptSection();
-    const inferenceRulesSection = buildQimenInferenceRulesSection();
-    const scoreAuditPromptSection = buildScoreAuditPromptSection({
+    const scoreEvidenceSection = buildScoreEvidenceSection({
         scoreAudit: backendScoreAudit,
         scoreInput: backendScoreInput,
         yongshenRule
     });
-    const frontendCopyProtocolSection = buildFrontendCopyProtocolSection();
-    const outputContractSection = buildQimenOutputContractSection({
-        routeConfidence: detectedIntent.confidence,
-        backendScore: backendScoreAudit.final_score
-    });
 
-    const finalPrompt = `你是一位精通“时家奇门拆补转盘法”的奇门遁甲预测大师。
-起局时间：${timestamp_solar}(${timestamp_lunar})。
-干支四柱：${qimenData.pillars.year} ${qimenData.pillars.month} ${qimenData.pillars.day} ${qimenData.pillars.hour}。${qimen_structure}。${juResult.jieQiName} ${juResult.yuanName} ；
-旬首:${xunHead}。值符:${zhiFuStar}。值使:${zhiShiDoor}。空亡：日空${dayKongObj} 时空${hourKongObj}。驿马星：日马${dayMa} 时马${hourMa}。
+    // system 全是固定文字（角色、解盘步骤、推断要点、文案规则、输出格式），每次请求前缀相同，吃 DeepSeek 前缀缓存；
+    // user 放本次的问题和盘面材料，问题紧挨盘面、模型读规则时已经知道要回答什么。
+    const qimenUserPrompt = `【用户问题】
+<user_question>
+${userQuestion}
+</user_question>
+
+【起局信息】
+起局时间：${timestamp_solar}（${timestamp_lunar}）。
+干支四柱：${qimenData.pillars.year} ${qimenData.pillars.month} ${qimenData.pillars.day} ${qimenData.pillars.hour}。${qimen_structure}。${juResult.jieQiName} ${juResult.yuanName}。
+旬首：${xunHead}。值符：${toSimplified(zhiFuStar)}。值使：${toSimplified(zhiShiDoor)}。空亡：日空${dayKongObj} 时空${hourKongObj}。驿马：日马${dayMa} 时马${hourMa}。
+
+【九宫盘面】
 ${palacesText}
-
-求测人命理信息(可选，若为空表示未提供)
+【求测人命理信息】
 ${effectiveBaziInfo}
 
-**【核心推演逻辑】**
-1. ${yongshenPromptSection}
-   - **补充限制**：如果上文提供了“求测人八字/命理信息”，请务必提取其出生年的天干作为“年命”落宫，结合日干落宫综合判断；若未提供，直接以“日干”代表求测人。
-   - **审计要求**：你必须把当前 category/subcategory 对应的取用神规则作为审计依据。若你认为上游分类或子分类不贴合用户问题，必须在 intent_audit 中说明，并评估这是否导致后端工程指标偏差。
+【取用神规则】
+${toSimplified(yongshenPromptSection)}
 
-${inferenceRulesSection}
+【用神卡片规则】
+${toSimplified(domainViewPromptSection)}
+${polarityPromptSection ? `\n【格局极性】\n${toSimplified(polarityPromptSection)}\n` : ''}
+【应期】
+${toSimplified(timingPromptSection)}
+${scoreEvidenceSection}
 
-2. **断吉凶（注重静态盘面）**：
-   - 分析五行生克、吉凶格、空亡（能量减半/待填实）、马星（变动/加速），对比核心用神宫位的生克关系。
-   - ① 先列出所有"凶象/警示信号"（空亡、伏吟、死门、凶星、击刑等），如实呈现，不得美化。
-   - ② 再分析吉象与支撑力。
-   - ③ **禁止：**不得因求测者问题为正向就盲目倾向高分。
-   - ④ 若下方出现“格局极性翻转表命中”，必须按覆盖后的问题域语义判分；若未出现该段，则按常规吉凶规则判断。
-
-3. **抓应期与动态破局（核心！必须执行）**：
-   - **绝不能死守静态凶象！** 如果盘面出现“杜门(堵塞)”、“九地(慢)”、“空亡”等阻碍，必须向后推演当天的**十二时辰**。
-   - 寻找破局点：是否有某个时辰的五行**克制了忌神**（如金克木劈开杜门）？是否有**驿马星**被特定时辰引动（冲动/传送）？是否空亡宫位到了某个时辰被**填实或冲动**？
-   - 如果时辰动态能冲破静态阻碍，说明事情“先难后易”或“即将发生”，必须在综合评分和结论中体现这一转机。
-
-4. **给建议（心理关怀的边界）**：
-   - 在 advice 中给予有温度的行动建议。真实的关怀 = 提前预警风险 + 给出应对方案（包含如何利用破局时辰），而非回避风险。
-
-${scoreAuditPromptSection}
-
-${summaryPromptSection}
-
-${reportSchemaSection}
-
-${domainViewPromptSection}
-
-${polarityPromptSection}
-
-${timingPromptSection}
-
-${frontendCopyProtocolSection}
-
-${outputContractSection}
-
-务必做到有根据、有理论支持，分析的详细还要体会我问问题的心理潜在因素，照顾我的心理感受。你先分析，我下面要问你问题了。
-问题：${userQuestion}`;
+请按 system 中的步骤和输出格式，回答 <user_question> 里的问题。${contentLocale === 'en-US' ? `\n${outputLanguage.buildUserLanguageReminder(contentLocale)}` : ''}`;
+    const qimenPrompt = { system: buildQimenSystemPrompt(contentLocale), user: qimenUserPrompt };
 
     // ── SSE Step 5: AI 推演开始（流式文字输出） ──
     emit({ type: 'active', index: 5, pct: 78 });
 
-    const textPrompt = convertQimenPromptToTextMode(finalPrompt);
     const questionModel = resolveQuestionModel(env);
     // 7 个面向用户的散文段流式可见；data_json 段静默累积。
     const QIMEN_VISIBLE_SECTIONS = new Set([
@@ -2388,29 +2349,35 @@ ${outputContractSection}
       onVisibleDelta: (section, text) => emit({ type: 'llm_delta', section, text })
     });
     const _qimenTraceMeta = { name: 'qimen-answer', scenario: 'qimen', category: detectedIntent.category, tags: ['qimen', `category:${detectedIntent.category}`], userId: userId || guestId };
-    for await (const chunk of requestLLMSimpleStream(textPrompt, env, questionModel, 0.7, ctx, _qimenTraceMeta)) {
+    for await (const chunk of requestLLMSimpleStream(qimenPrompt, env, questionModel, QIMEN_ANSWER_TEMPERATURE, ctx, _qimenTraceMeta)) {
       llmFullText += chunk;
       sentinelParser.push(chunk);
     }
     // 结构校验：空流 / 核心段缺失 / data_json 不可解析 → 打回让 LLM 重试一次（非流式）
     let sec = sentinelParser.finish();
-    if (qimenSectionsAreBad(sec)) {
-      console.warn('[qimen-api] bad structure, retrying non-streaming...', { len: llmFullText.length });
+    const QIMEN_PROSE_KEYS = ['conclusion', 'subject_reading', 'target_reading', 'environment_reading', 'support_summary', 'constraint_summary', 'decision_reading'];
+    let outputLocaleMixed = false;
+    if (qimenSectionsAreBad(sec) || proseLocaleIsBad(sec, QIMEN_PROSE_KEYS, contentLocale)) {
+      console.warn('[qimen-api] bad structure, retrying non-streaming...', { len: llmFullText.length, contentLocale });
       // 通知前端清空已显示的半截内容，重置回骨架
-      emit({ type: 'llm_retry', message: 'AI 重新推演中…' });
+      emit({ type: 'llm_retry', message: 'AI 重新推演中…', messageKey: 'sse.llmRetry' });
       try {
-        llmFullText = await requestLLMText(textPrompt, env, questionModel, 0.7, ctx, { ..._qimenTraceMeta, name: 'qimen-answer-retry' });
+        llmFullText = await requestLLMText(qimenPrompt, env, questionModel, QIMEN_ANSWER_TEMPERATURE, ctx, { ..._qimenTraceMeta, name: 'qimen-answer-retry' });
       } catch (retryErr) {
         console.error('[qimen-api] retry also failed:', retryErr.message);
-        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试', code: 'LLM_UNAVAILABLE' });
         return;
       }
       const retryParser = createSentinelStreamParser(QIMEN_VISIBLE_SECTIONS, {});
       retryParser.push(llmFullText);
       sec = retryParser.finish();
       if (qimenSectionsAreBad(sec)) {
-        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试' });
+        emit({ type: 'error', message: 'AI 推演暂时不可用，请稍后重试', code: 'LLM_UNAVAILABLE' });
         return;
+      }
+      if (proseLocaleIsBad(sec, QIMEN_PROSE_KEYS, contentLocale)) {
+        outputLocaleMixed = true;
+        console.warn('[i18n] output locale mismatch after retry', { trace: 'qimen-answer-retry', contentLocale });
       }
       // 用重试内容重新 emit 可见段（含 title）
       const VISIBLE_ORDER = ['conclusion', 'subject_reading', 'target_reading',
@@ -2490,7 +2457,7 @@ ${outputContractSection}
     const m3Inference = (aiJsonData.qimen_report || {}).m3_inference;
     const rawScoreBasisFallback = (aiJsonData.summary || {}).score_basis || {};
     const derivedBasis = m3Inference
-        ? deriveScoreBasisFromM3(m3Inference, backendScoreAudit.adjustments, finalScore)
+        ? deriveScoreBasisFromM3(m3Inference, backendScoreAudit.adjustments, finalScore, contentLocale)
         : {
             positive_signals: rawScoreBasisFallback.positive_signals,
             negative_signals: rawScoreBasisFallback.negative_signals,
@@ -2499,7 +2466,7 @@ ${outputContractSection}
     const sanitizedPositiveSignals = sanitizeSignalList(derivedBasis.positive_signals);
     const sanitizedNegativeSignals = sanitizeSignalList(derivedBasis.negative_signals);
     const sanitizedScoreLogic = sanitizeUserText(derivedBasis.score_logic)
-        || `综合用神状态、主客关系、空亡与应期后，本局落在${finalScore >= 75 ? '偏有利' : finalScore >= 60 ? '中等可观察' : finalScore >= 40 ? '偏谨慎' : '明显谨慎'}区间。`;
+        || serverMessages.scoreLogicFallback(finalScore, contentLocale);
     postprocessAudit.sanitized_summary_basis = {
         positive_signals: sanitizedPositiveSignals,
         negative_signals: sanitizedNegativeSignals,
@@ -2621,15 +2588,12 @@ ${outputContractSection}
                 timing: backendScoreAudit.timing
             },
             promptBlocks: [
+                'system:buildQimenSystemPrompt',
                 'buildYongshenPromptSection',
-                'buildQimenInferenceRulesSection',
-                'buildScoreAuditPromptSection',
-                'buildSummaryPromptSection',
                 'buildDomainViewPromptSection',
                 'buildPolarityPromptSection',
                 'buildTimingPromptSection',
-                'buildFrontendCopyProtocolSection',
-                'buildQimenOutputContractSection',
+                'buildScoreEvidenceSection',
                 detectedIntent.role ? `role:${detectedIntent.role}` : '',
                 detectedIntent.category ? `category:${detectedIntent.category}` : '',
                 detectedIntent.subcategory ? `subcategory:${detectedIntent.subcategory}` : ''
@@ -2642,7 +2606,7 @@ ${outputContractSection}
                 timing_analysis: timingAnalysis,
                 polarity_overrides: polarityOverrides
             },
-            llmPromptText: textPrompt,
+            llmPromptText: promptToText(qimenPrompt),
             llmOutputRaw: { text: llmFullText, mode: 'sentinel_stream', parsed: rawQimenLlmOutput },
             llmOutputNormalized: aiJsonData,
             timingLlmOutput: rawLlmTimingReview,
@@ -2655,6 +2619,7 @@ ${outputContractSection}
         });
 
         try {
+            Object.assign(qimenAuditSnapshot, getRequestGeo(request, body));
             const supabase = createSupabaseClient(env);
             const { error: auditError } = await supabase.from('qimen_question_audit').insert(qimenAuditSnapshot);
             if (auditError) console.warn('[qimen-api] qimen audit insert failed:', auditError.message || auditError);
@@ -2662,12 +2627,14 @@ ${outputContractSection}
             console.warn('[qimen-api] qimen audit insert failed:', auditErr.message || auditErr);
         }
 	
+    finalOutput.output_locale = contentLocale;
+    if (outputLocaleMixed) finalOutput.output_locale_actual = 'mixed';
     qimenMemoryCache[cacheKey] = finalOutput;
     emit({ type: 'complete', result: finalOutput });
 
   } catch (error) {
     console.error('[qimen-api] qimen error:', error);
-    emit({ type: 'error', message: error.message || '奇门引擎推演失败' });
+    emit({ type: 'error', message: error.message || '奇门引擎推演失败', code: error.code || serverMessages.inferErrorCode(error.message, error.status || 500) });
   } finally {
     close();
   }
@@ -2681,6 +2648,7 @@ async function handleBazi(request, env, ctx) {
   try {
     const user = await getAuthedUser(request, env);
     const body = await readJson(request);
+    const { contentLocale } = requestLocaleLib.resolveRequestLocale({ bodyLocale: body?.locale });
     const promptData = body.promptData;
     if (!promptData || !promptData.profileId) return json({ error: "缺少档案 ID" }, { status: 400 }, request, env);
 
@@ -2737,8 +2705,8 @@ async function handleBazi(request, env, ctx) {
 
     (async () => {
       try {
-        emit({ type: 'step', index: 0, pct: 10, label: '校验档案' });
-        emit({ type: 'step', index: 1, pct: 25, label: '排盘计算' });
+        emit(sseChips.profileStep(0, 10, 'validate'));
+        emit(sseChips.profileStep(1, 25, 'compute'));
 
         const engineQualitative = {
           ...buildQualitativeSections({
@@ -2811,9 +2779,9 @@ async function handleBazi(request, env, ctx) {
             unfavorable_elements: engineUpdatePayload.unfavorable_elements
           }
         });
-        emit({ type: 'step', index: 2, pct: 50, label: 'AI 断语生成' });
+        emit(sseChips.profileStep(2, 50, 'llm'));
 
-        const promptText = buildBaziProfileSectionPrompt({
+        const promptText = outputLanguage.appendOutputLanguage(buildBaziProfileSectionPrompt({
           gender: promptData.gender,
           birthStr: promptData.birthStr,
           baziStr: promptData.baziStr,
@@ -2825,7 +2793,7 @@ async function handleBazi(request, env, ctx) {
           imageAnalysis: baziDetail.image_analysis,
           currentDaYunText,
           currentLiuNianText
-        });
+        }), contentLocale);
 
         let llmSections;
         try {
@@ -2833,12 +2801,28 @@ async function handleBazi(request, env, ctx) {
             onSectionStart: (section) => emit({ type: 'llm_section_start', section }),
             onDelta: (section, text) => emit({ type: 'llm_delta', section, text }),
             onSectionDone: (section, text) => emit({ type: 'llm_section_done', section, text }),
-          }, deepModel(env), 0.65, ctx, { name: 'bazi-profile-sections', scenario: 'bazi-profile-init', userId: user.id });
+          }, deepModel(env), BAZI_ANSWER_TEMPERATURE, ctx, { name: 'bazi-profile-sections', scenario: 'bazi-profile-init', userId: user.id });
         } catch (llmError) {
           console.warn('[qimen-api] bazi llm stream failed:', llmError.message || llmError);
-          emit({ type: 'llm_error', message: 'AI 深度断语暂时不可用，已保留规则引擎结果' });
+          emit({ type: 'llm_error', message: 'AI 深度断语暂时不可用，已保留规则引擎结果', code: 'LLM_UNAVAILABLE_PARTIAL' });
           emit({ type: 'complete', pct: 100, profileId: promptData.profileId, partial: true });
           return;
+        }
+        // 英文请求：三段断语任一段不是英文 → 重试一次，只发整段替换（llm_section_done），不叠加旧文字
+        const PROFILE_PROSE_KEYS = Object.keys(llmSections || {});
+        if (proseLocaleIsBad(llmSections, PROFILE_PROSE_KEYS, contentLocale)) {
+          console.warn('[i18n] bazi profile sections not in requested language, retrying once', { contentLocale });
+          try {
+            const retried = await requestLLMStreamSections(promptText, env, {
+              onSectionDone: (section, text) => emit({ type: 'llm_section_done', section, text }),
+            }, deepModel(env), BAZI_ANSWER_TEMPERATURE, ctx, { name: 'bazi-profile-sections-locale-retry', scenario: 'bazi-profile-init', userId: user.id });
+            if (retried && Object.keys(retried).length) llmSections = retried;
+            if (proseLocaleIsBad(llmSections, Object.keys(llmSections), contentLocale)) {
+              console.warn('[i18n] output locale mismatch after retry', { trace: 'bazi-profile-sections-locale-retry', contentLocale });
+            }
+          } catch (retryErr) {
+            console.warn('[i18n] bazi profile locale retry failed, keeping first answer:', retryErr.message || retryErr);
+          }
         }
 
         const llmQualitative = {
@@ -2848,7 +2832,8 @@ async function handleBazi(request, env, ctx) {
             engineQualitativeData
           }),
           status: 'llm_complete',
-          display_source: 'llm'
+          display_source: 'llm',
+          output_locale: contentLocale
         };
         const finalBaziDetail = {
           ...baziDetail,
@@ -2887,7 +2872,7 @@ async function handleBazi(request, env, ctx) {
         emit({ type: 'complete', pct: 100, profileId: promptData.profileId });
       } catch (streamError) {
         console.error('[qimen-api] bazi stream error:', streamError);
-        emit({ type: 'error', message: streamError.message || '八字引擎推演失败' });
+        emit({ type: 'error', message: streamError.message || '八字引擎推演失败', code: streamError.code || serverMessages.inferErrorCode(streamError.message, streamError.status || 500) });
       } finally {
         close();
       }
@@ -2897,7 +2882,7 @@ async function handleBazi(request, env, ctx) {
 
   } catch (error) {
     console.error('[qimen-api] bazi error:', error);
-    const isQuota = error.message && error.message.includes("额度");
+    const isQuota = error.code === 'QUOTA_EXCEEDED';
     return json({ error: "八字引擎推演失败", details: error.message }, { status: isQuota ? 403 : 500 }, request, env);
   }
 }
@@ -2917,64 +2902,19 @@ async function handleCompatibilityInit(request, env) {
       return json({ error: 'profileA and profileB required' }, { status: 400 }, request, env);
     }
 
-    // Zhi index 0-11 (子丑…亥) → representative solar hour (mid of 2-hr block)
-    const ZHI_MID_HOURS = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
-
-    function parsePerson(p) {
-      const dateParts = String(p.birth_date || '').split('-').map(Number);
-      const y = dateParts[0] || 2000, m = dateParts[1] || 1, d = dateParts[2] || 1;
-      const hi = parseInt(p.hour_index ?? -1);
-      let baseH = hi >= 0 ? ZHI_MID_HOURS[hi] : 12;
-      let baseMin = 0;
-
-      // Apply true solar time correction (in minutes, already computed on frontend)
-      const tstMin = parseInt(p.tst_correction_min || 0);
-      baseMin += tstMin;
-      if (baseMin < 0) { baseH -= 1; baseMin += 60; }
-      if (baseMin >= 60) { baseH += 1; baseMin -= 60; }
-      baseH = ((baseH % 24) + 24) % 24;
-
-      const solar = Solar.fromYmdHms(y, m, d, baseH, baseMin, 0);
-      const baZi = solar.getLunar().getEightChar();
-      const isMale = p.gender === 'M' || p.gender === '男';
-      const detail = buildCompleteBaziDetail({
-        baZi,
-        yun: baZi.getYun(isMale ? 1 : 0),
-        isMale,
-        currentYear: new Date().getFullYear(),
-      });
-
-      const gz = detail.pillars?.ganzhi || {};
-      return {
-        dayGan: (gz.day || '')[0] || '',
-        gans: [
-          (gz.year  || '')[0] || '',
-          (gz.month || '')[0] || '',
-          (gz.day   || '')[0] || '',
-          hi >= 0 ? (gz.time || '')[0] || '' : '',
-        ],
-        zhis: [
-          (gz.year  || '')[1] || '',
-          (gz.month || '')[1] || '',
-          detail.day_zhi   || (gz.day   || '')[1] || '',
-          hi >= 0 ? (gz.time || '')[1] || '' : '',
-        ],
-        dayZhi:   detail.day_zhi   || '',
-        yearZhi:  detail.year_zhi  || '',
-        monthZhi: detail.month_zhi || '',
-        five_shens:   detail.five_shens   || {},
-        wuxing_ratio: detail.wuxing_ratio || {},
-      };
-    }
-
-    const compactA = parsePerson(profileA);
-    const compactB = parsePerson(profileB);
+    // 排盘与合盘计算都在 lib/synastry：时辰不详时十二时辰取稳定结论，真太阳时修正跨日进退
+    const relationType = synastry.normalizeRelationType(body.relationType);
+    const { A: compactA, B: compactB, report } = synastry.buildCompatibilityResponse(profileA, profileB, {
+      relationType,
+      currentYear: new Date().getFullYear(),
+    });
+    const friendDims = report.friendDims || null;
 
     // Persist session (best-effort – don't fail the response if DB is unavailable)
     let sessionId = null;
     try {
       const supabase = createSupabaseClient(env);
-      const { data: session } = await supabase
+      const { data: session, error: insertError } = await supabase
         .from('compatibility_sessions')
         .insert({
           name_a: profileA.name || null,
@@ -2993,15 +2933,23 @@ async function handleCompatibilityInit(request, env) {
           hour_index_b: profileB.hour_index != null ? Number(profileB.hour_index) : -1,
           bazi_compact_a: compactA,
           bazi_compact_b: compactB,
+          relation_type: relationType,
+          engine_version: report.engineVersion,
+          report,
+          dim_scores: friendDims
+            ? { d1: friendDims.d1, d2: friendDims.d2, d3: friendDims.d3, d4: friendDims.d4, d5: friendDims.d5 }
+            : null,
+          total_score: friendDims ? friendDims.total : null,
         })
         .select('id')
         .single();
+      if (insertError) console.warn('[compatibility/init] db insert failed:', insertError.message);
       sessionId = session?.id || null;
     } catch (dbErr) {
       console.error('[compatibility/init] db insert failed:', dbErr.message);
     }
 
-    return json({ ok: true, sessionId, A: compactA, B: compactB }, { status: 200 }, request, env);
+    return json({ ok: true, sessionId, A: compactA, B: compactB, report }, { status: 200 }, request, env);
   } catch (e) {
     console.error('[compatibility/init] error:', e);
     return json({ error: e.message }, { status: 500 }, request, env);
